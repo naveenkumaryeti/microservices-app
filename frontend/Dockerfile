@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────
-# Stage 1: Build (kept minimal — static site
+# Stage 1: Build (kept minimal — static site )
 # ─────────────────────────────────────────────
 FROM node:20-alpine AS builder
 
