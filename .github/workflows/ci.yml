@@ -1,0 +1,77 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# CI Workflow — Lint & Build Validation on Pull Requests
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Runs on every push to main and on every pull request.
+# Validates that all Docker images build successfully WITHOUT pushing.
+# This is the gate before a release is created.
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: CI — Validate Builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true    # cancel stale PR runs when new commits arrive
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Build all images (no push) to catch Dockerfile regressions early
+  # ────────────────────────────────────────────────────────────────────────────
+  validate-builds:
+    name: 🔨 Validate Build — ${{ matrix.service }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false         # show all failures, not just the first
+      matrix:
+        include:
+          - service: frontend
+            context: ./frontend
+            dockerfile: ./frontend/Dockerfile
+          - service: backend
+            context: ./backend
+            dockerfile: ./backend/Dockerfile
+          - service: database
+            context: ./database
+            dockerfile: ./database/Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.service }} (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context:    ${{ matrix.context }}
+          file:       ${{ matrix.dockerfile }}
+          push:       false      # validation only — never push from CI
+          tags:       ${{ matrix.service }}:ci
+          cache-from: type=gha,scope=ci-${{ matrix.service }}
+          cache-to:   type=gha,mode=max,scope=ci-${{ matrix.service }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Validate docker-compose syntax
+  # ────────────────────────────────────────────────────────────────────────────
+  validate-compose:
+    name: ✅ Validate docker-compose.yml
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate compose file
+        run: docker compose config --quiet

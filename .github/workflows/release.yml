@@ -1,0 +1,400 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Release Workflow — Build · Tag · Push · Package · Publish
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Triggers on every GitHub Release publication.
+# Responsibilities (ONLY):
+#   1. Extract version from the release tag (e.g. v1.0.0)
+#   2. Build Docker images for frontend / backend / database
+#   3. Tag each image with <version> and latest
+#   4. Push all images to GitHub Container Registry (GHCR)
+#   5. Bundle a release package (ZIP) and upload as a Release Asset
+#   6. Generate release notes and a workflow summary
+#
+# NO deployment is performed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: Release — Build, Push & Package
+
+# ── Trigger ───────────────────────────────────────────────────────────────────
+on:
+  release:
+    types: [published]   # fires when a GitHub Release is published
+
+# ── Concurrency — prevent duplicate runs for the same release tag ─────────────
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # never cancel an in-progress release
+
+# ── Minimal, explicit permissions ─────────────────────────────────────────────
+permissions:
+  contents: write            # needed to upload release assets
+  packages: write            # needed to push to GHCR
+  id-token: write            # needed if you later add OIDC / cosign signing
+
+# ── Environment variables shared across all jobs ──────────────────────────────
+env:
+  REGISTRY: ghcr.io
+  # github.repository is automatically  <owner>/<repo>
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+# ══════════════════════════════════════════════════════════════════════════════
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — extract-version
+  # Parse the release tag and expose it to downstream jobs.
+  # ────────────────────────────────────────────────────────────────────────────
+  extract-version:
+    name: 📋 Extract Version
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.parse.outputs.version }}      # e.g.  v1.0.0
+      version_plain: ${{ steps.parse.outputs.plain }}  # e.g.  1.0.0
+
+    steps:
+      - name: Parse release tag
+        id: parse
+        run: |
+          # github.ref_name is the tag name, e.g. "v1.0.0"
+          TAG="${{ github.ref_name }}"
+
+          # Validate the tag follows semver vX.Y.Z format
+          if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "❌ Tag '$TAG' does not match vX.Y.Z format" >&2
+            exit 1
+          fi
+
+          VERSION="$TAG"                    # v1.0.0
+          PLAIN="${TAG#v}"                   # 1.0.0
+
+          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
+          echo "plain=$PLAIN"       >> "$GITHUB_OUTPUT"
+
+          echo "✅ Release version: $VERSION"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2 — build-and-push
+  # Build all three Docker images and push them to GHCR.
+  # Strategy matrix keeps images in parallel while sharing login/setup.
+  # ────────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: 🐳 Build & Push — ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: extract-version
+
+    strategy:
+      fail-fast: true          # abort remaining if any service fails
+      matrix:
+        include:
+          - service: frontend
+            context: ./frontend
+            dockerfile: ./frontend/Dockerfile
+          - service: backend
+            context: ./backend
+            dockerfile: ./backend/Dockerfile
+          - service: database
+            context: ./database
+            dockerfile: ./database/Dockerfile
+
+    steps:
+      # ── 1. Checkout source code ────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Docker Buildx (multi-platform builder) ──────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Use docker-container driver for full BuildKit feature support
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      # ── 3. Authenticate to GHCR using GITHUB_TOKEN ────────────────────────
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # auto-provided by GitHub Actions
+
+      # ── 4. Generate image metadata (tags + labels) ────────────────────────
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.service }}
+          tags: |
+            # Versioned tag  — ghcr.io/<owner>/<service>:v1.0.0
+            type=raw,value=${{ needs.extract-version.outputs.version }}
+            # Latest tag     — ghcr.io/<owner>/<service>:latest
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.extract-version.outputs.version_plain }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      # ── 5. Build & push with layer caching ────────────────────────────────
+      - name: Build and push ${{ matrix.service }} image
+        uses: docker/build-push-action@v5
+        with:
+          context:    ${{ matrix.context }}
+          file:       ${{ matrix.dockerfile }}
+          push:       true
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache — reuses layers across workflow runs
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to:   type=gha,mode=max,scope=${{ matrix.service }}
+          # Provenance attestation (sbom + provenance by default in Buildx v0.11+)
+          provenance: false   # set true to attach SLSA provenance
+
+      # ── 6. Save image digest for summary ──────────────────────────────────
+      - name: Export image digest
+        run: |
+          echo "${{ matrix.service }}_digest=$(docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ matrix.service }}:${{ needs.extract-version.outputs.version }} \
+            --format '{{.Manifest.Digest}}' 2>/dev/null || echo 'n/a')" \
+            >> "$GITHUB_ENV"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3 — package-release
+  # Bundle deployment artefacts into a ZIP and upload to the GitHub Release.
+  # ────────────────────────────────────────────────────────────────────────────
+  package-release:
+    name: 📦 Package Release Asset
+    runs-on: ubuntu-latest
+    needs: [extract-version, build-and-push]
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Prepare release directory structure ────────────────────────────
+      - name: Create release directory
+        run: |
+          VERSION="${{ needs.extract-version.outputs.version }}"
+          mkdir -p release/{frontend,backend,database}
+
+          # Copy service source trees (excluding node_modules / build artefacts)
+          rsync -a --exclude='node_modules' --exclude='.git' frontend/ release/frontend/
+          rsync -a --exclude='node_modules' --exclude='.git' backend/  release/backend/
+          rsync -a                                           database/ release/database/
+
+          # Copy root-level deployment files
+          cp docker-compose.yml release/
+          cp README.md          release/ 2>/dev/null || echo "# ${VERSION}" > release/README.md
+
+          # Write VERSION file
+          echo "$VERSION" > release/VERSION
+
+          echo "📁 Release package contents:"
+          find release -type f | sort
+
+      # ── 3. Generate deployment docker-compose with pinned image tags ──────
+      - name: Generate production docker-compose
+        run: |
+          VERSION="${{ needs.extract-version.outputs.version }}"
+          OWNER="${{ env.IMAGE_OWNER }}"
+          REGISTRY="${{ env.REGISTRY }}"
+
+          cat > release/docker-compose.prod.yml <<EOF
+          # Production docker-compose — images pulled from GHCR
+          # Usage: docker compose -f docker-compose.prod.yml up -d
+          version: "3.9"
+
+          services:
+            database:
+              image: ${REGISTRY}/${OWNER}/database:${VERSION}
+              restart: unless-stopped
+              environment:
+                POSTGRES_DB:       appdb
+                POSTGRES_USER:     appuser
+                POSTGRES_PASSWORD: \${DB_PASSWORD:?DB_PASSWORD required}
+              volumes:
+                - db-data:/var/lib/postgresql/data
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U appuser -d appdb"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+              networks: [ms-network]
+
+            backend:
+              image: ${REGISTRY}/${OWNER}/backend:${VERSION}
+              restart: unless-stopped
+              environment:
+                PORT:        3000
+                DB_HOST:     database
+                DB_PORT:     5432
+                DB_NAME:     appdb
+                DB_USER:     appuser
+                DB_PASSWORD: \${DB_PASSWORD:?DB_PASSWORD required}
+                APP_VERSION: ${VERSION}
+              depends_on:
+                database:
+                  condition: service_healthy
+              ports: ["3000:3000"]
+              networks: [ms-network]
+
+            frontend:
+              image: ${REGISTRY}/${OWNER}/frontend:${VERSION}
+              restart: unless-stopped
+              ports: ["8080:80"]
+              depends_on: [backend]
+              networks: [ms-network]
+
+          volumes:
+            db-data:
+          networks:
+            ms-network:
+          EOF
+
+          echo "✅ Production compose file generated"
+
+      # ── 4. Create ZIP archive ──────────────────────────────────────────────
+      - name: Create release ZIP
+        run: |
+          VERSION="${{ needs.extract-version.outputs.version }}"
+          ZIP_NAME="release-${VERSION}.zip"
+
+          zip -r "$ZIP_NAME" release/
+
+          echo "ZIP_NAME=$ZIP_NAME"           >> "$GITHUB_ENV"
+          echo "ZIP_PATH=$(pwd)/$ZIP_NAME"    >> "$GITHUB_ENV"
+
+          echo "📦 Created: $ZIP_NAME ($(du -sh "$ZIP_NAME" | cut -f1))"
+
+      # ── 5. Upload ZIP as a GitHub Release Asset ────────────────────────────
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url:         ${{ github.event.release.upload_url }}
+          asset_path:         ${{ env.ZIP_PATH }}
+          asset_name:         ${{ env.ZIP_NAME }}
+          asset_content_type: application/zip
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 4 — release-notes
+  # Update the GitHub Release body with Docker image info and publish a
+  # workflow summary.
+  # ────────────────────────────────────────────────────────────────────────────
+  release-notes:
+    name: 📝 Publish Release Notes & Summary
+    runs-on: ubuntu-latest
+    needs: [extract-version, build-and-push, package-release]
+
+    steps:
+      # ── 1. Generate and append release notes ──────────────────────────────
+      - name: Update GitHub Release notes
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const version    = '${{ needs.extract-version.outputs.version }}';
+            const owner      = '${{ env.IMAGE_OWNER }}';
+            const registry   = '${{ env.REGISTRY }}';
+            const sha        = '${{ github.sha }}'.substring(0, 7);
+            const runUrl     = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const zipName    = `release-${version}.zip`;
+
+            const services   = ['frontend', 'backend', 'database'];
+            const imageRows  = services.map(svc =>
+              `| \`${svc}\` | \`${registry}/${owner}/${svc}:${version}\` | \`${registry}/${owner}/${svc}:latest\` |`
+            ).join('\n');
+
+            const pullCmds = services.map(svc =>
+              `docker pull ${registry}/${owner}/${svc}:${version}`
+            ).join('\n');
+
+            const body = `
+            ## 🚀 Release ${version}
+
+            > Commit: \`${sha}\` · [Workflow run](${runUrl})
+
+            ---
+
+            ### 🐳 Docker Images
+
+            | Service | Versioned Tag | Latest Tag |
+            |---------|--------------|-----------|
+            ${imageRows}
+
+            ### 📥 Pull Commands
+
+            \`\`\`bash
+            ${pullCmds}
+            \`\`\`
+
+            ### 📦 Release Asset
+
+            Download **\`${zipName}\`** from the Assets section below.
+
+            The ZIP contains:
+            \`\`\`
+            release/
+            ├── frontend/          # Nginx static frontend
+            ├── backend/           # Express API source
+            ├── database/          # PostgreSQL init scripts
+            ├── docker-compose.yml         # Local dev compose
+            ├── docker-compose.prod.yml    # Production compose (pinned tags)
+            ├── README.md
+            └── VERSION
+            \`\`\`
+
+            Run locally:
+            \`\`\`bash
+            unzip ${zipName}
+            cd release
+            # Set required secret
+            export DB_PASSWORD=your-secure-password
+            docker compose -f docker-compose.prod.yml up -d
+            \`\`\`
+            `.trim();
+
+            await github.rest.repos.updateRelease({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              release_id: context.payload.release.id,
+              body:       body,
+            });
+
+            core.info('✅ Release notes updated');
+
+      # ── 2. Publish workflow summary ────────────────────────────────────────
+      - name: Write workflow summary
+        run: |
+          VERSION="${{ needs.extract-version.outputs.version }}"
+          OWNER="${{ env.IMAGE_OWNER }}"
+          REGISTRY="${{ env.REGISTRY }}"
+          ZIP_NAME="release-${VERSION}.zip"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          # ✅ Release ${VERSION} — Published Successfully
+
+          | Property        | Value |
+          |-----------------|-------|
+          | Release Version | \`${VERSION}\` |
+          | Commit SHA      | \`${{ github.sha }}\` |
+          | Release Asset   | \`${ZIP_NAME}\` |
+
+          ## 🐳 Docker Images
+
+          | Service  | Image URL |
+          |----------|-----------|
+          | Frontend | \`${REGISTRY}/${OWNER}/frontend:${VERSION}\` |
+          | Backend  | \`${REGISTRY}/${OWNER}/backend:${VERSION}\` |
+          | Database | \`${REGISTRY}/${OWNER}/database:${VERSION}\` |
+
+          ## 📥 Pull Commands
+          \`\`\`bash
+          docker pull ${REGISTRY}/${OWNER}/frontend:${VERSION}
+          docker pull ${REGISTRY}/${OWNER}/backend:${VERSION}
+          docker pull ${REGISTRY}/${OWNER}/database:${VERSION}
+          \`\`\`
+          EOF
